@@ -5,7 +5,7 @@ import math
 import sqlite3
 import json
 
-TYPES = ['Ingreso', 'Gasto', 'Transferencia', 'Pago de deuda']
+TYPES = ['Ingreso', 'Gasto', 'Transferencia', 'Pago de deuda', 'Reembolso']
 CATEGORIES = ['Sueldo', 'Vivienda', 'Comida', 'Transporte', 'Servicios', 'Salud', 'Ocio', 'Otros']
 
 def money(value, decimal='.'):
@@ -70,6 +70,8 @@ class Store:
         self.db = sqlite3.connect(path)
         self.db.execute('CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, value TEXT)')
         self.db.execute('CREATE TABLE IF NOT EXISTS movements (id INTEGER PRIMARY KEY, fecha TEXT, descripcion TEXT, monto REAL, tipo TEXT, categoria TEXT, cuenta TEXT)')
+        if "import_key" not in [r[1] for r in self.db.execute("PRAGMA table_info(movements)")]:
+            self.db.execute("ALTER TABLE movements ADD COLUMN import_key TEXT")
         self.db.commit()
     def settings(self):
         row = self.db.execute('SELECT value FROM settings WHERE id=1').fetchone()
@@ -79,16 +81,17 @@ class Store:
             self.db.execute('INSERT OR REPLACE INTO settings VALUES(1, ?)', (json.dumps(value),))
     def movements(self):
         keys = ['id', 'fecha', 'descripcion', 'monto', 'tipo', 'categoria', 'cuenta']
-        return [dict(zip(keys, row)) for row in self.db.execute('SELECT * FROM movements ORDER BY fecha, id')]
+        return [dict(zip(keys, row)) for row in self.db.execute('SELECT id,fecha,descripcion,monto,tipo,categoria,cuenta FROM movements ORDER BY fecha, id')]
     def insert(self, rows, skip_duplicates=True):
         count = 0
         with self.db:
             for r in rows:
                 values = (r['fecha'], r['descripcion'], r['monto'], r['tipo'], r['categoria'], r['cuenta'])
-                exists = self.db.execute('SELECT 1 FROM movements WHERE fecha=? AND descripcion=? AND monto=? AND tipo=? AND categoria=? AND cuenta=?', values).fetchone()
+                import_key = r.get('_clave_importacion')
+                exists = (self.db.execute('SELECT 1 FROM movements WHERE import_key=?', (import_key,)).fetchone() if import_key else self.db.execute('SELECT 1 FROM movements WHERE fecha=? AND descripcion=? AND monto=? AND tipo=? AND categoria=? AND cuenta=?', values).fetchone())
                 if skip_duplicates and exists:
                     continue
-                self.db.execute('INSERT INTO movements(fecha,descripcion,monto,tipo,categoria,cuenta) VALUES(?,?,?,?,?,?)', values)
+                self.db.execute('INSERT INTO movements(fecha,descripcion,monto,tipo,categoria,cuenta,import_key) VALUES(?,?,?,?,?,?,?)', (*values,import_key))
                 count += 1
         return count
     def delete(self, ids):

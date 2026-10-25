@@ -9,7 +9,7 @@ import streamlit as st
 from core import Store, TYPES, CATEGORIES, money, paydays, debt_plan
 
 st.set_page_config(page_title='Campa Finanzas', page_icon='💰', layout='wide')
-st.markdown('''<style>.stApp{background:#f5f7fb}h1,h2,h3{color:#17364b}div[data-testid="stMetric"]{background:white;border:1px solid #dce5ec;border-radius:14px;padding:18px}</style>''', unsafe_allow_html=True)
+st.markdown('''<style>div[data-testid="stMetric"]{background:var(--secondary-background-color);border:1px solid #dce5ec;border-radius:14px;padding:18px}</style>''', unsafe_allow_html=True)
 path = Path(os.environ.get('CAMPA_DATA_DIR', str(Path(__file__).parent / 'datos')))
 path.mkdir(parents=True, exist_ok=True)
 store = Store(path / 'finanzas.sqlite3')
@@ -21,7 +21,7 @@ def cash(x):
 def table(key, columns):
     return pd.DataFrame(cfg.get(key, []), columns=columns)
 
-def validate_table(zdf, numeric):
+def validate_table(df, numeric):
     records = []
     for row in df.to_dict('records'):
         if not str(row.get('nombre', row.get('categoria', '')) or '').strip():
@@ -90,14 +90,15 @@ if page == 'Resumen':
     sums = current.groupby('tipo').monto.sum() if len(current) else {}
     a,b,c = st.columns(3)
     a.metric('Ingresos reales', cash(sums.get('Ingreso', 0)))
-    b.metric('Gastos reales', cash(sums.get('Gasto', 0)))
+    b.metric('Gastos netos reales', cash(sums.get('Gasto', 0) - sums.get('Reembolso', 0)))
     c.metric('Pagos de deuda reales', cash(sums.get('Pago de deuda', 0)))
-    st.caption('Transferencias excluidas de ingresos y gastos. Los datos reflejan únicamente lo registrado; no son el saldo bancario.')
-    cats = set(budgets.categoria) | set(fixed.categoria) | set(current[current.tipo == 'Gasto'].categoria)
+    st.caption('Gastos netos = gastos menos reembolsos. Transferencias excluidas de ingresos y gastos. Los datos reflejan únicamente lo registrado; no son el saldo bancario.')
+    cats = set(budgets.categoria) | set(fixed.categoria) | set(current[current.tipo.isin(['Gasto', 'Reembolso'])].categoria)
     comparison = []
     for cat in sorted(cats):
         planned = float(budgets.loc[budgets.categoria == cat, 'monto'].sum() + fixed.loc[fixed.categoria == cat, 'monto'].sum())
         actual = float(current.loc[(current.tipo == 'Gasto') & (current.categoria == cat), 'monto'].sum())
+        actual -= float(current.loc[(current.tipo == 'Reembolso') & (current.categoria == cat), 'monto'].sum())
         comparison.append({'Categoría': cat, 'Plan': planned, 'Real': actual, 'Restante': planned-actual})
     if comparison:
         comp = pd.DataFrame(comparison).set_index('Categoría')
@@ -160,80 +161,8 @@ elif page == 'Movimientos':
     st.download_button('Exportar movimientos del mes', current.to_csv(index=False).encode('utf-8-sig'), 'movimientos.csv', 'text/csv')
 
 elif page == 'Importar estado':
-    st.subheader('Importar CSV o Excel')
-    st.caption('Requiere una tabla con fecha, descripción e importe; admite cargo y abono separados. PDF y archivos protegidos no están incluidos.')
-    upload = st.file_uploader('Estado de cuenta', type=['csv', 'xlsx'])
-    if upload:
-        signature = hashlib.sha256(upload.getvalue()).hexdigest()
-        if st.session_state.get('upload_signature') != signature:
-            st.session_state.pop('preview', None)
-            st.session_state.pop('import_errors', None)
-            st.session_state['upload_signature'] = signature
-        try:
-            if upload.name.lower().endswith('.csv'):
-                a,b = st.columns(2)
-                sep = a.selectbox('Separador', [',', ';', '\t'])
-                encoding = b.selectbox('Codificación', ['utf-8-sig', 'latin-1'])
-                raw = pd.read_csv(io.BytesIO(upload.getvalue()), sep=sep, encoding=encoding, dtype=str)
-            else:
-                book = pd.ExcelFile(io.BytesIO(upload.getvalue()))
-                sheet = st.selectbox('Hoja', book.sheet_names)
-                raw = pd.read_excel(book, sheet_name=sheet, dtype=str)
-            st.dataframe(raw.head(8), hide_index=True)
-            columns = raw.columns.tolist()
-            fc = st.selectbox('Columna fecha', columns)
-            dc = st.selectbox('Columna descripción', columns, index=min(1,len(columns)-1))
-            mode = st.radio('Formato de importes', ['Una columna con signo', 'Cargo y abono separados'])
-            decimal = st.selectbox('Separador decimal', ['.', ','])
-            fmt = st.selectbox('Formato de fecha', ['%d/%m/%Y', '%Y-%m-%d', '%m/%d/%Y', '%d-%m-%Y'])
-            account = st.text_input('Cuenta de estos movimientos', 'Principal')
-            if mode == 'Una columna con signo':
-                mc = st.selectbox('Importe', columns, index=min(2,len(columns)-1))
-                positive_income = st.checkbox('Positivos son ingresos y negativos son gastos', value=True)
-            else:
-                charge = st.selectbox('Cargo', columns)
-                credit = st.selectbox('Abono', columns, index=min(1,len(columns)-1))
-            if st.button('Preparar revisión'):
-                records, errors = [], []
-                for idx, r in raw.iterrows():
-                    try:
-                        day = pd.to_datetime(r[fc], format=fmt, errors='raise').date()
-                        if pd.isna(day) or pd.isna(r[dc]) or not str(r[dc]).strip():
-                            raise ValueError('Fecha o descripción vacía')
-                        if mode == 'Una columna con signo':
-                            value = money(r[mc], decimal) * (1 if positive_income else -1)
-                        else:
-                            def optional(v):
-                                return 0 if pd.isna(v) or not str(v).strip() else money(v, decimal)
-                            debit, deposit = optional(r[charge]), optional(r[credit])
-                            if debit < 0 or deposit < 0 or (debit and deposit):
-                                raise ValueError('Cargo/abono deben ser positivos y solo uno por fila')
-                            value = deposit-debit
-                        if value == 0:
-                            raise ValueError('Importe cero')
-                        records.append(dict(fecha=str(day), descripcion=str(r[dc]), monto=abs(value), tipo='Ingreso' if value>0 else 'Gasto', categoria='Otros', cuenta=account))
-                    except (ValueError, TypeError) as e:
-                        errors.append(f'Fila {idx+2}: {e}')
-                st.session_state['preview'] = records
-                st.session_state['import_errors'] = errors
-            for error in st.session_state.get('import_errors', []):
-                st.error(error)
-            if st.session_state.get('preview'):
-                st.info('Revisa TODAS las filas: clasifica transferencias y pagos de tarjeta antes de confirmar. Las filas inválidas no se incluyen.')
-                edited = st.data_editor(pd.DataFrame(st.session_state['preview']), hide_index=True, use_container_width=True, column_config={'tipo':st.column_config.SelectboxColumn(options=TYPES, required=True)})
-                skip = st.checkbox('Omitir coincidencias exactas ya guardadas', True)
-                st.caption('La coincidencia usa fecha, descripción, importe, tipo, categoría y cuenta. Desactiva esta opción si son operaciones legítimas idénticas; un cambio de clasificación puede permitir duplicados.')
-                if st.button('Confirmar y guardar', type='primary'):
-                    records = edited.to_dict('records')
-                    for r in records:
-                        date.fromisoformat(str(r['fecha']))
-                        if r['tipo'] not in TYPES or not pd.notna(r['monto']) or float(r['monto']) <= 0 or any(not str(r[k] or '').strip() for k in ['cuenta','descripcion','categoria']):
-                            raise ValueError('Revisa tipos, importes y campos vacíos.')
-                    n = store.insert(records, skip)
-                    st.session_state.pop('preview', None)
-                    st.success(f'{n} movimientos guardados. Abre Movimientos para revisarlos.')
-        except Exception as e:
-            st.error(f'No se pudo procesar: {e}')
+    from import_ui import render_import
+    render_import(store)
 
 elif page == 'Ahorro y deudas':
     st.subheader('Tus próximos objetivos')
